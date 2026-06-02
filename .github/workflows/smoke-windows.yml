@@ -1,0 +1,137 @@
+name: Smoke Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pr-13-windows]
+    paths:
+      - ".github/workflows/smoke-windows.yml"
+      - "scripts/**"
+      - "bin/**"
+      - "package.json"
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      FORK_TAG: v0.0.0-fork-test.1
+      FORK_REPO: TongWu-ZL/open-code-review
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: pr-13-windows
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Show OS / arch
+        run: |
+          echo "platform=$(node -e 'console.log(process.platform)')"
+          echo "arch=$(node -e 'console.log(process.arch)')"
+
+      # ---------- 1) 改写 package.json，让 install/update 指向 fork release ----------
+      - name: Patch package.json (version + urlPattern)
+        run: |
+          # 备份原文件，便于排查
+          cp package.json package.json.orig
+
+          # 把 version 设为 0.0.0，使 update.js 一定认为有新版本
+          # 把 urlPattern 写死到 fork release（不含 {version}，避免 update.js 拼出找不到的 URL）
+          jq --arg repo "$FORK_REPO" --arg tag "$FORK_TAG" '
+            .version = "0.0.0"
+            | .ocrConfig.urlPattern =
+                "https://github.com/" + $repo + "/releases/download/" + $tag + "/opencodereview-{os}-{arch}"
+            | del(.ocrConfig.checksumPattern)   # PR 未给 windows checksum 拼 .exe，先移除避免噪声
+          ' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          echo "----- patched package.json -----"
+          jq '{version, ocrConfig}' package.json
+
+      # ---------- 2) 测 scripts/install.js（npm install 会触发 postinstall）----------
+      - name: npm install (triggers scripts/install.js)
+        env:
+          OCR_NO_UPDATE: "1" # 防止 install 完后立刻又触发一次自动 update
+        run: npm install --foreground-scripts
+
+      - name: Verify install.js produced bin/opencodereview.exe
+        run: |
+          echo "----- bin/ -----"
+          ls -la bin/
+          test -f bin/opencodereview.exe || { echo "::error::bin/opencodereview.exe MISSING"; exit 1; }
+          # Windows PE 可执行文件应以 'MZ' 开头
+          head -c 2 bin/opencodereview.exe | xxd | grep -q '4d5a' \
+            || { echo "::error::file is not a PE executable"; exit 1; }
+          # 不应残留无后缀的 unix 文件
+          if [ -f bin/opencodereview ]; then
+            echo "::error::stray unix binary bin/opencodereview present on windows"
+            exit 1
+          fi
+
+      # ---------- 3) 测 bin/ocr.js 的 IS_WINDOWS 分支 ----------
+      - name: Run via bin/ocr.js
+        env:
+          OCR_NO_UPDATE: "1"
+        run: |
+          node bin/ocr.js --help || node bin/ocr.js -h || node bin/ocr.js
+          echo "ocr.js dispatched to .exe successfully"
+
+      # ---------- 4) 测 scripts/update.js ----------
+      - name: Snapshot binary before update
+        id: before
+        run: |
+          BEFORE=$(sha256sum bin/opencodereview.exe | awk '{print $1}')
+          echo "hash=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "before=$BEFORE"
+
+      - name: Force update.js to run (clear lockfile / timestamp)
+        run: |
+          rm -rf "$HOME/.opencodereview"
+          # update.js 也会读 package.json 的 version；我们在 step 1 已设为 0.0.0
+          # 让它去 npm registry 查 latest，然后从 fork release 重新下载
+          node scripts/update.js
+          echo "update.js exit code: $?"
+
+      - name: Verify update.js result
+        run: |
+          ls -la bin/
+          test -f bin/opencodereview.exe || { echo "::error::binary disappeared after update"; exit 1; }
+          # 不应残留临时文件
+          if ls bin/.opencodereview.tmp.* 2>/dev/null; then
+            echo "::error::leftover temp file from update.js"
+            exit 1
+          fi
+          # MZ 头依然合法
+          head -c 2 bin/opencodereview.exe | xxd | grep -q '4d5a' \
+            || { echo "::error::binary corrupted after update"; exit 1; }
+
+      - name: Re-run via bin/ocr.js after update
+        env:
+          OCR_NO_UPDATE: "1"
+        run: node bin/ocr.js --help || node bin/ocr.js -h || node bin/ocr.js
+
+      - name: Compare hashes (informational)
+        run: |
+          AFTER=$(sha256sum bin/opencodereview.exe | awk '{print $1}')
+          echo "before=${{ steps.before.outputs.hash }}"
+          echo "after=$AFTER"
+          # 因为 install 和 update 都是从同一个 fork tag 下载，hash 通常应该相同；
+          # 不强制断言，只是打印出来便于人工核对。
+
+      # ---------- 5) 留下排查日志 ----------
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-windows-debug
+          path: |
+            bin/
+            package.json
+            package.json.orig
+            ~/.opencodereview/
+          if-no-files-found: ignore
