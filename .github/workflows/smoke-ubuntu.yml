@@ -5,7 +5,7 @@ on:
   push:
     branches: [pr-13-windows]
     paths:
-      - ".github/workflows/smoke-windows.yml"
+      - ".github/workflows/smoke-ubuntu.yml"
       - "scripts/**"
       - "bin/**"
       - "package.json"
