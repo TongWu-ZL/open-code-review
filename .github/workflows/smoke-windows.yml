@@ -37,41 +37,55 @@ jobs:
       # ---------- 1) 改写 package.json，让 install/update 指向 fork release ----------
       - name: Patch package.json (version + urlPattern)
         run: |
-          # 备份原文件，便于排查
           cp package.json package.json.orig
 
           # 把 version 设为 0.0.0，使 update.js 一定认为有新版本
           # 把 urlPattern 写死到 fork release（不含 {version}，避免 update.js 拼出找不到的 URL）
+          # 删除 checksumPattern：PR 未给 windows checksum 拼 .exe，先移除避免噪声
           jq --arg repo "$FORK_REPO" --arg tag "$FORK_TAG" '
             .version = "0.0.0"
             | .ocrConfig.urlPattern =
                 "https://github.com/" + $repo + "/releases/download/" + $tag + "/opencodereview-{os}-{arch}"
-            | del(.ocrConfig.checksumPattern)   # PR 未给 windows checksum 拼 .exe，先移除避免噪声
+            | del(.ocrConfig.checksumPattern)
           ' package.json > package.json.tmp
           mv package.json.tmp package.json
 
           echo "----- patched package.json -----"
           jq '{version, ocrConfig}' package.json
 
-      # ---------- 2) 测 scripts/install.js（npm install 会触发 postinstall）----------
+      # ---------- 2) 测 scripts/install.js ----------
       - name: npm install (triggers scripts/install.js)
         env:
-          OCR_NO_UPDATE: "1" # 防止 install 完后立刻又触发一次自动 update
+          OCR_NO_UPDATE: "1"
         run: npm install --foreground-scripts
 
       - name: Verify install.js produced bin/opencodereview.exe
         run: |
           echo "----- bin/ -----"
           ls -la bin/
-          test -f bin/opencodereview.exe || { echo "::error::bin/opencodereview.exe MISSING"; exit 1; }
-          # Windows PE 可执行文件应以 'MZ' 开头
-          head -c 2 bin/opencodereview.exe | xxd | grep -q '4d5a' \
-            || { echo "::error::file is not a PE executable"; exit 1; }
-          # 不应残留无后缀的 unix 文件
-          if [ -f bin/opencodereview ]; then
-            echo "::error::stray unix binary bin/opencodereview present on windows"
-            exit 1
-          fi
+
+          # 用 readdir 精确比对文件名，避开 Git Bash/MSYS 对 [ -f foo ] 自动补 .exe 的行为
+          node -e '
+            const fs = require("fs");
+            const files = fs.readdirSync("bin");
+            console.log("readdir(bin):", files);
+
+            if (!files.includes("opencodereview.exe")) {
+              console.error("::error::bin/opencodereview.exe MISSING");
+              process.exit(1);
+            }
+            if (files.includes("opencodereview")) {
+              console.error("::error::stray unix binary bin/opencodereview present on windows");
+              process.exit(1);
+            }
+
+            const head = fs.readFileSync("bin/opencodereview.exe").subarray(0, 2);
+            if (head[0] !== 0x4d || head[1] !== 0x5a) {
+              console.error("::error::bin/opencodereview.exe is not a PE executable (no MZ header)");
+              process.exit(1);
+            }
+            console.log("install.js verification OK");
+          '
 
       # ---------- 3) 测 bin/ocr.js 的 IS_WINDOWS 分支 ----------
       - name: Run via bin/ocr.js
@@ -92,23 +106,39 @@ jobs:
       - name: Force update.js to run (clear lockfile / timestamp)
         run: |
           rm -rf "$HOME/.opencodereview"
-          # update.js 也会读 package.json 的 version；我们在 step 1 已设为 0.0.0
-          # 让它去 npm registry 查 latest，然后从 fork release 重新下载
           node scripts/update.js
           echo "update.js exit code: $?"
 
       - name: Verify update.js result
         run: |
+          echo "----- bin/ after update -----"
           ls -la bin/
-          test -f bin/opencodereview.exe || { echo "::error::binary disappeared after update"; exit 1; }
-          # 不应残留临时文件
-          if ls bin/.opencodereview.tmp.* 2>/dev/null; then
-            echo "::error::leftover temp file from update.js"
-            exit 1
-          fi
-          # MZ 头依然合法
-          head -c 2 bin/opencodereview.exe | xxd | grep -q '4d5a' \
-            || { echo "::error::binary corrupted after update"; exit 1; }
+
+          node -e '
+            const fs = require("fs");
+            const files = fs.readdirSync("bin");
+            console.log("readdir(bin):", files);
+
+            if (!files.includes("opencodereview.exe")) {
+              console.error("::error::binary disappeared after update");
+              process.exit(1);
+            }
+            if (files.includes("opencodereview")) {
+              console.error("::error::stray unix binary bin/opencodereview present after update");
+              process.exit(1);
+            }
+            const leftover = files.filter(f => f.startsWith(".opencodereview.tmp."));
+            if (leftover.length) {
+              console.error("::error::leftover temp file(s) from update.js: " + leftover.join(", "));
+              process.exit(1);
+            }
+            const head = fs.readFileSync("bin/opencodereview.exe").subarray(0, 2);
+            if (head[0] !== 0x4d || head[1] !== 0x5a) {
+              console.error("::error::binary corrupted after update (no MZ header)");
+              process.exit(1);
+            }
+            console.log("update.js verification OK");
+          '
 
       - name: Re-run via bin/ocr.js after update
         env:
@@ -120,10 +150,8 @@ jobs:
           AFTER=$(sha256sum bin/opencodereview.exe | awk '{print $1}')
           echo "before=${{ steps.before.outputs.hash }}"
           echo "after=$AFTER"
-          # 因为 install 和 update 都是从同一个 fork tag 下载，hash 通常应该相同；
-          # 不强制断言，只是打印出来便于人工核对。
 
-      # ---------- 5) 留下排查日志 ----------
+      # ---------- 5) 失败时上传产物 ----------
       - name: Upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -133,5 +161,4 @@ jobs:
             bin/
             package.json
             package.json.orig
-            ~/.opencodereview/
           if-no-files-found: ignore
