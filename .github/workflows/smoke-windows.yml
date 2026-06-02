@@ -46,7 +46,6 @@ jobs:
             .version = "0.0.0"
             | .ocrConfig.urlPattern =
                 "https://github.com/" + $repo + "/releases/download/" + $tag + "/opencodereview-{os}-{arch}"
-            | del(.ocrConfig.checksumPattern)
           ' package.json > package.json.tmp
           mv package.json.tmp package.json
 
