@@ -19,6 +19,8 @@ jobs:
     env:
       FORK_TAG: v0.0.0-fork-test.1
       FORK_REPO: TongWu-ZL/open-code-review
+      EXPECTED_OS: linux
+      MAGIC_HEX: "7f454c46" # ELF
 
     steps:
       - uses: actions/checkout@v4
@@ -34,96 +36,95 @@ jobs:
           echo "platform=$(node -e 'console.log(process.platform)')"
           echo "arch=$(node -e 'console.log(process.arch)')"
 
-      # ---------- 1) 改写 package.json，让 install/update 指向 fork release ----------
       - name: Patch package.json (version + urlPattern)
         run: |
           cp package.json package.json.orig
-
-          # 把 version 设为 0.0.0，使 update.js 一定认为有新版本
-          # 把 urlPattern 写死到 fork release（不含 {version}，避免 update.js 拼出找不到的 URL）
-          # 删除 checksumPattern：PR 未给 windows checksum 拼 .exe，先移除避免噪声
           jq --arg repo "$FORK_REPO" --arg tag "$FORK_TAG" '
             .version = "0.0.0"
             | .ocrConfig.urlPattern =
                 "https://github.com/" + $repo + "/releases/download/" + $tag + "/opencodereview-{os}-{arch}"
           ' package.json > package.json.tmp
           mv package.json.tmp package.json
-
           echo "----- patched package.json -----"
           jq '{version, ocrConfig}' package.json
 
-      # ---------- 2) 测 scripts/install.js ----------
       - name: npm install (triggers scripts/install.js)
         env:
           OCR_NO_UPDATE: "1"
         run: npm install --foreground-scripts
 
-      - name: Verify install.js produced bin/opencodereview.exe
+      - name: Verify install.js produced bin/opencodereview
+        env:
+          MAGIC_HEX: ${{ env.MAGIC_HEX }}
         run: |
           echo "----- bin/ -----"
           ls -la bin/
-
-          # 用 readdir 精确比对文件名，避开 Git Bash/MSYS 对 [ -f foo ] 自动补 .exe 的行为
           node -e '
             const fs = require("fs");
+            const expectedMagic = process.env.MAGIC_HEX;
             const files = fs.readdirSync("bin");
             console.log("readdir(bin):", files);
 
-            if (!files.includes("opencodereview.exe")) {
-              console.error("::error::bin/opencodereview.exe MISSING");
+            if (!files.includes("opencodereview")) {
+              console.error("::error::bin/opencodereview MISSING");
               process.exit(1);
             }
-            if (files.includes("opencodereview")) {
-              console.error("::error::stray unix binary bin/opencodereview present on windows");
+            if (files.includes("opencodereview.exe")) {
+              console.error("::error::stray windows binary bin/opencodereview.exe present on unix");
               process.exit(1);
             }
 
-            const head = fs.readFileSync("bin/opencodereview.exe").subarray(0, 2);
-            if (head[0] !== 0x4d || head[1] !== 0x5a) {
-              console.error("::error::bin/opencodereview.exe is not a PE executable (no MZ header)");
+            const head = fs.readFileSync("bin/opencodereview").subarray(0, 4).toString("hex");
+            if (head !== expectedMagic) {
+              console.error("::error::magic bytes " + head + " != expected " + expectedMagic);
+              process.exit(1);
+            }
+            const stat = fs.statSync("bin/opencodereview");
+            if (!(stat.mode & 0o111)) {
+              console.error("::error::bin/opencodereview is not executable (mode=" + stat.mode.toString(8) + ")");
               process.exit(1);
             }
             console.log("install.js verification OK");
           '
 
-      # ---------- 3) 测 bin/ocr.js 的 IS_WINDOWS 分支 ----------
       - name: Run via bin/ocr.js
         env:
           OCR_NO_UPDATE: "1"
         run: |
           node bin/ocr.js --help || node bin/ocr.js -h || node bin/ocr.js
-          echo "ocr.js dispatched to .exe successfully"
+          echo "ocr.js dispatched successfully"
 
-      # ---------- 4) 测 scripts/update.js ----------
       - name: Snapshot binary before update
         id: before
         run: |
-          BEFORE=$(sha256sum bin/opencodereview.exe | awk '{print $1}')
+          BEFORE=$(shasum -a 256 bin/opencodereview | awk '{print $1}')
           echo "hash=$BEFORE" >> "$GITHUB_OUTPUT"
           echo "before=$BEFORE"
 
-      - name: Force update.js to run (clear lockfile / timestamp)
+      - name: Force update.js to run
         run: |
           rm -rf "$HOME/.opencodereview"
           node scripts/update.js
           echo "update.js exit code: $?"
 
       - name: Verify update.js result
+        env:
+          MAGIC_HEX: ${{ env.MAGIC_HEX }}
         run: |
           echo "----- bin/ after update -----"
           ls -la bin/
-
           node -e '
             const fs = require("fs");
+            const expectedMagic = process.env.MAGIC_HEX;
             const files = fs.readdirSync("bin");
             console.log("readdir(bin):", files);
 
-            if (!files.includes("opencodereview.exe")) {
+            if (!files.includes("opencodereview")) {
               console.error("::error::binary disappeared after update");
               process.exit(1);
             }
-            if (files.includes("opencodereview")) {
-              console.error("::error::stray unix binary bin/opencodereview present after update");
+            if (files.includes("opencodereview.exe")) {
+              console.error("::error::stray windows binary bin/opencodereview.exe present after update");
               process.exit(1);
             }
             const leftover = files.filter(f => f.startsWith(".opencodereview.tmp."));
@@ -131,9 +132,14 @@ jobs:
               console.error("::error::leftover temp file(s) from update.js: " + leftover.join(", "));
               process.exit(1);
             }
-            const head = fs.readFileSync("bin/opencodereview.exe").subarray(0, 2);
-            if (head[0] !== 0x4d || head[1] !== 0x5a) {
-              console.error("::error::binary corrupted after update (no MZ header)");
+            const head = fs.readFileSync("bin/opencodereview").subarray(0, 4).toString("hex");
+            if (head !== expectedMagic) {
+              console.error("::error::binary corrupted after update (magic=" + head + ")");
+              process.exit(1);
+            }
+            const stat = fs.statSync("bin/opencodereview");
+            if (!(stat.mode & 0o111)) {
+              console.error("::error::binary not executable after update");
               process.exit(1);
             }
             console.log("update.js verification OK");
@@ -146,16 +152,15 @@ jobs:
 
       - name: Compare hashes (informational)
         run: |
-          AFTER=$(sha256sum bin/opencodereview.exe | awk '{print $1}')
+          AFTER=$(shasum -a 256 bin/opencodereview | awk '{print $1}')
           echo "before=${{ steps.before.outputs.hash }}"
           echo "after=$AFTER"
 
-      # ---------- 5) 失败时上传产物 ----------
       - name: Upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-windows-debug
+          name: smoke-ubuntu-debug
           path: |
             bin/
             package.json
